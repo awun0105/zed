@@ -11572,7 +11572,7 @@ mod tests {
                 );
 
                 // Blur the editor so that it displays placeholder text.
-                window.blur();
+                window.blur(cx);
             })
             .unwrap();
 
