@@ -298,6 +298,9 @@ pub trait Platform: 'static {
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem>;
     fn write_to_clipboard(&self, item: ClipboardItem);
+    fn try_write_to_clipboard(&self, _item: ClipboardItem) -> Result<()> {
+        anyhow::bail!("Writing this clipboard item is unsupported")
+    }
 
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     fn read_from_primary(&self) -> Option<ClipboardItem>;
@@ -812,6 +815,17 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         detail: Option<&str>,
         answers: &[PromptButton],
     ) -> Option<oneshot::Receiver<usize>>;
+    /// `None` forbids capture-time hiding because this backend has no visibility fence.
+    fn retained_visibility(&self) -> Option<bool> {
+        None
+    }
+    /// Retains the window and renderer state until the compositor acknowledges the change.
+    fn set_retained_visibility(
+        &self,
+        _visible: bool,
+    ) -> Result<oneshot::Receiver<Result<(u64, bool)>>> {
+        anyhow::bail!("Retained window visibility is unsupported by this backend")
+    }
     fn activate(&self);
     /// Requests that the operating system draw attention to this window.
     fn request_attention(&self) {}

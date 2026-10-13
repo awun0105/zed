@@ -1350,6 +1350,11 @@ impl App {
         self.platform.write_to_clipboard(item)
     }
 
+    /// Writes data to the platform clipboard, returning an error when the platform cannot accept it.
+    pub fn try_write_to_clipboard(&self, item: ClipboardItem) -> Result<()> {
+        self.platform.try_write_to_clipboard(item)
+    }
+
     /// Reads data from the primary selection buffer.
     /// Only available on Linux.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]

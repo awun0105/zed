@@ -1517,13 +1517,17 @@ impl Window {
                 // Throttle frame rate based on conditions:
                 // - Thermal pressure (Serious/Critical): cap to ~60fps
                 // - Inactive window (not focused): cap to ~30fps to save energy
+                let will_draw = invalidator.is_dirty() || request_frame_options.force_render;
                 let min_frame_interval = if !request_frame_options.force_render
                     && !request_frame_options.require_presentation
                     && next_frame_callbacks.borrow().is_empty()
                 {
                     None
                 } else if !active.get() {
-                    Some(Duration::from_micros(33333))
+                    // The skip below returns before the dirty check, so without
+                    // this an unrelated pending next-frame callback caps fresh
+                    // content at 30fps -- video playback in an unfocused window.
+                    (!will_draw).then_some(Duration::from_micros(33333))
                 } else if let Some(ThermalState::Critical | ThermalState::Serious) = thermal_state {
                     Some(Duration::from_micros(16667))
                 } else {
@@ -2445,6 +2449,19 @@ impl Window {
     /// Returns which window controls are currently visible (Wayland)
     pub fn window_controls(&self) -> WindowControls {
         self.platform_window.window_controls()
+    }
+
+    /// This is retained state; capture still needs a completed visibility receipt.
+    pub fn retained_visibility(&self) -> Option<bool> {
+        self.platform_window.retained_visibility()
+    }
+
+    /// The receipt acknowledges compositor processing, not physical presentation.
+    pub fn set_retained_visibility(
+        &mut self,
+        visible: bool,
+    ) -> anyhow::Result<futures::channel::oneshot::Receiver<anyhow::Result<(u64, bool)>>> {
+        self.platform_window.set_retained_visibility(visible)
     }
 
     /// Updates the window's title at the platform level.
@@ -4542,16 +4559,56 @@ impl Window {
     /// This method should only be called as part of the paint phase of element drawing.
     #[cfg(target_os = "macos")]
     pub fn paint_surface(&mut self, bounds: Bounds<Pixels>, image_buffer: CVPixelBuffer) {
+        self.paint_surface_fitted(bounds, bounds, Corners::default(), image_buffer);
+    }
+
+    /// [`Self::paint_surface`] for object-fit layouts: paint the `visible`
+    /// rect of a surface whose fitted content box is `fitted` (equal or
+    /// larger, e.g. `ObjectFit::Cover`), cropping via the surface's source
+    /// UVs so `corner_radii` round the element's actual corners — the same
+    /// contract as [`Self::paint_image_fitted`].
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    #[cfg(target_os = "macos")]
+    pub fn paint_surface_fitted(
+        &mut self,
+        visible: Bounds<Pixels>,
+        fitted: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        image_buffer: CVPixelBuffer,
+    ) {
         use crate::PaintSurface;
 
         self.invalidator.debug_assert_paint();
 
-        let bounds = self.snap_bounds(bounds);
+        let source_uv = if visible == fitted {
+            Bounds {
+                origin: point(0., 0.),
+                size: size(1., 1.),
+            }
+        } else {
+            let fitted_width = f32::from(fitted.size.width).max(1.0);
+            let fitted_height = f32::from(fitted.size.height).max(1.0);
+            Bounds {
+                origin: point(
+                    (f32::from(visible.origin.x) - f32::from(fitted.origin.x)) / fitted_width,
+                    (f32::from(visible.origin.y) - f32::from(fitted.origin.y)) / fitted_height,
+                ),
+                size: size(
+                    f32::from(visible.size.width) / fitted_width,
+                    f32::from(visible.size.height) / fitted_height,
+                ),
+            }
+        };
+        let bounds = self.snap_bounds(visible);
         let content_mask = self.snapped_content_mask();
+        let corner_radii = corner_radii.scale(self.scale_factor());
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
             bounds,
             content_mask,
+            corner_radii,
+            source_uv,
             image_buffer,
         });
     }

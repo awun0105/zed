@@ -4,7 +4,6 @@ use crate::{
     kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
     ns_string, renderer,
 };
-#[cfg(any(test, feature = "test-support"))]
 use anyhow::Result;
 use block::ConcreteBlock;
 use cocoa::{
@@ -773,7 +772,9 @@ impl MacWindow {
         foreground_executor: ForegroundExecutor,
         background_executor: BackgroundExecutor,
         renderer_context: renderer::Context,
-    ) -> Self {
+    ) -> Result<Self> {
+        let renderer =
+            objc::rc::autoreleasepool(|| renderer::new_renderer(renderer_context, false))?;
         unsafe {
             let pool = NSAutoreleasePool::new(nil);
 
@@ -893,13 +894,7 @@ impl MacWindow {
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
                 frame_source: None,
-                renderer: renderer::new_renderer(
-                    renderer_context,
-                    native_window as *mut _,
-                    native_view as *mut _,
-                    bounds.size.map(|pixels| pixels.as_f32()),
-                    false,
-                ),
+                renderer,
                 request_frame_callback: None,
                 event_callback: None,
                 activate_callback: None,
@@ -1098,7 +1093,7 @@ impl MacWindow {
 
             pool.drain();
 
-            window
+            Ok(window)
         }
     }
 
@@ -1177,8 +1172,12 @@ impl Drop for MacWindow {
             this.native_window.setDelegate_(nil);
         }
         this.input_handler.take();
-        this.foreground_executor
+        let accesskit_adapter = this.accesskit_adapter.take();
+        let foreground_executor = this.foreground_executor.clone();
+        drop(this);
+        foreground_executor
             .spawn(async move {
+                drop(accesskit_adapter);
                 unsafe {
                     if let Some(parent) = sheet_parent {
                         let _: () = msg_send![parent, endSheet: window];
@@ -3132,7 +3131,8 @@ unsafe fn remove_layer_background(layer: id) {
                 let hit: BOOL = msg_send![description, containsString: blur_test];
                 if hit == YES {
                     let radius: id = msg_send![class!(NSNumber), numberWithDouble: 60.0f64];
-                    let _: () = msg_send![filter, setValue: radius forKey: ns_string("inputRadius")];
+                    let _: () =
+                        msg_send![filter, setValue: radius forKey: ns_string("inputRadius")];
                     let _: () = msg_send![layer, setFilters: filters];
                     break;
                 }

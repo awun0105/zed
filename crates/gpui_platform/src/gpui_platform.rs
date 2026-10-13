@@ -64,9 +64,13 @@ pub fn current_platform(headless: bool) -> Rc<dyn Platform> {
 pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRenderer>> {
     #[cfg(target_os = "macos")]
     {
-        Some(Box::new(
-            gpui_macos::metal_renderer::MetalHeadlessRenderer::new(),
-        ))
+        match gpui_macos::metal_renderer::MetalHeadlessRenderer::new() {
+            Ok(renderer) => Some(Box::new(renderer)),
+            Err(error) => {
+                eprintln!("failed to initialize headless Metal renderer: {error:#}");
+                None
+            }
+        }
     }
 
     #[cfg(not(target_os = "macos"))]

@@ -880,16 +880,30 @@ vertex SurfaceVertexOutput surface_vertex(
       to_device_position(unit_vertex, surface.bounds, viewport_size);
   float4 clip_distance = distance_from_clip_rect(unit_vertex, surface.bounds,
                                                  surface.content_mask.bounds);
-  // We are going to copy the whole texture, so the texture position corresponds
-  // to the current vertex of the unit triangle.
-  float2 texture_position = unit_vertex;
+  float2 texture_position =
+      float2(surface.source_uv.origin.x, surface.source_uv.origin.y) +
+      unit_vertex * float2(surface.source_uv.size.width,
+                           surface.source_uv.size.height);
   return SurfaceVertexOutput{
       device_position,
       texture_position,
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
+float surface_corner_alpha(float2 position, SurfaceBounds surface) {
+  float max_radius = max(
+      max(surface.corner_radii.top_left, surface.corner_radii.top_right),
+      max(surface.corner_radii.bottom_left, surface.corner_radii.bottom_right));
+  if (max_radius <= 0.) {
+    return 1.;
+  }
+  float distance = quad_sdf(position, surface.bounds, surface.corner_radii);
+  return saturate(0.5 - distance);
+}
+
 fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
+                                 constant SurfaceBounds *surfaces
+                                 [[buffer(SurfaceInputIndex_Surfaces)]],
                                  texture2d<float> y_texture
                                  [[texture(SurfaceInputIndex_YTexture)]],
                                  texture2d<float> cb_cr_texture
@@ -904,7 +918,21 @@ fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
       y_texture.sample(texture_sampler, input.texture_position).r,
       cb_cr_texture.sample(texture_sampler, input.texture_position).rg, 1.0);
 
-  return ycbcrToRGBTransform * ycbcr;
+  float4 color = ycbcrToRGBTransform * ycbcr;
+  color.a *= surface_corner_alpha(input.position.xy, surfaces[0]);
+  return color;
+}
+
+fragment float4 surface_bgra_fragment(SurfaceFragmentInput input [[stage_in]],
+                                      constant SurfaceBounds *surfaces
+                                      [[buffer(SurfaceInputIndex_Surfaces)]],
+                                      texture2d<float> color_texture
+                                      [[texture(SurfaceInputIndex_YTexture)]]) {
+  constexpr sampler texture_sampler(mag_filter::linear, min_filter::linear);
+  float4 color = float4(
+      color_texture.sample(texture_sampler, input.texture_position).rgb, 1.0);
+  color.a *= surface_corner_alpha(input.position.xy, surfaces[0]);
+  return color;
 }
 
 float4 hsla_to_rgba(Hsla hsla) {

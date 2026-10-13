@@ -828,6 +828,10 @@ pub struct PaintSurface {
     pub order: DrawOrder,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
+    /// Normalized sub-rect of the source texture to sample, for object-fit
+    /// crops. The full texture is `(0,0)..(1,1)`.
+    pub source_uv: Bounds<f32>,
     #[cfg(target_os = "macos")]
     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
 }
