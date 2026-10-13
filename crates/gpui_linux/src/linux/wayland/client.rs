@@ -200,6 +200,7 @@ fn take_startup_activation_token_from_environment() -> Option<String> {
 
 #[derive(Clone)]
 pub struct Globals {
+    pub registry: wl_registry::WlRegistry,
     pub qh: QueueHandle<WaylandClientStatePtr>,
     pub activation: Option<xdg_activation_v1::XdgActivationV1>,
     pub compositor: wl_compositor::WlCompositor,
@@ -232,6 +233,7 @@ impl Globals {
     ) -> Self {
         let dialog_v = XdgWmDialogV1::interface().version;
         Globals {
+            registry: globals.registry().clone(),
             activation: globals.bind(&qh, 1..=1, ()).ok(),
             compositor: globals
                 .bind(
@@ -662,7 +664,7 @@ impl WaylandClient {
                             global.name,
                             wl_output_version(global.version),
                             &qh,
-                            (),
+                            global.name,
                         );
                         in_progress_outputs.insert(output.id(), InProgressOutput::default());
                         wl_outputs.insert(output.id(), output);
@@ -1121,6 +1123,30 @@ impl LinuxClient for WaylandClient {
         }
     }
 
+    fn try_write_to_clipboard(&self, item: gpui::ClipboardItem) -> anyhow::Result<()> {
+        let mut state = self.0.borrow_mut();
+        let data_device_manager = state.globals.data_device_manager.clone().ok_or_else(|| {
+            anyhow::anyhow!("Wayland clipboard data device manager is unavailable")
+        })?;
+        let data_device = state
+            .data_device
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Wayland clipboard data device is unavailable"))?;
+        if state.mouse_focused_window.is_none() && state.keyboard_focused_window.is_none() {
+            anyhow::bail!("Wayland clipboard requires a focused window");
+        }
+
+        let mime_types = state.clipboard.mime_types(&item)?;
+        state.clipboard.set(item);
+        let serial = state.serial_tracker.get_latest();
+        let data_source = data_device_manager.create_data_source(&state.globals.qh, ());
+        for mime_type in mime_types {
+            data_source.offer(mime_type);
+        }
+        data_device.set_selection(Some(&data_source), serial);
+        Ok(())
+    }
+
     fn read_from_primary(&self) -> Option<gpui::ClipboardItem> {
         self.0.borrow_mut().clipboard.read_primary()
     }
@@ -1262,7 +1288,7 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
                         name,
                         wl_output_version(version),
                         qh,
-                        (),
+                        name,
                     );
 
                     state
@@ -1300,6 +1326,25 @@ delegate_noop!(WaylandClientStatePtr: ignore zwp_text_input_manager_v3::ZwpTextI
 delegate_noop!(WaylandClientStatePtr: ignore org_kde_kwin_blur::OrgKdeKwinBlur);
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewporter::WpViewporter);
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewport::WpViewport);
+
+impl Dispatch<WlCallback, super::window::VisibilitySync> for WaylandClientStatePtr {
+    fn event(
+        this: &mut WaylandClientStatePtr,
+        _: &WlCallback,
+        event: wl_callback::Event,
+        sync: &super::window::VisibilitySync,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_callback::Event::Done { .. } = event {
+            let client = this.get_client();
+            let window = get_window(&mut client.borrow_mut(), &sync.surface);
+            if let Some(window) = window {
+                window.visibility_processed(sync);
+            }
+        }
+    }
+}
 
 impl Dispatch<WlCallback, ObjectId> for WaylandClientStatePtr {
     fn event(
@@ -1353,12 +1398,12 @@ impl Dispatch<wl_surface::WlSurface, ()> for WaylandClientStatePtr {
     }
 }
 
-impl Dispatch<wl_output::WlOutput, ()> for WaylandClientStatePtr {
+impl Dispatch<wl_output::WlOutput, u32> for WaylandClientStatePtr {
     fn event(
         this: &mut Self,
         output: &wl_output::WlOutput,
         event: <wl_output::WlOutput as Proxy>::Event,
-        _: &(),
+        _: &u32,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {

@@ -87,6 +87,9 @@ pub(crate) trait LinuxClient {
     fn reveal_path(&self, path: PathBuf);
     fn write_to_primary(&self, item: ClipboardItem);
     fn write_to_clipboard(&self, item: ClipboardItem);
+    fn try_write_to_clipboard(&self, _item: ClipboardItem) -> anyhow::Result<()> {
+        anyhow::bail!("Writing this clipboard item is unsupported")
+    }
     fn read_from_primary(&self) -> Option<ClipboardItem>;
     fn read_from_clipboard(&self) -> Option<ClipboardItem>;
     fn active_window(&self) -> Option<AnyWindowHandle>;
@@ -733,6 +736,10 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
         self.inner.write_to_clipboard(item)
+    }
+
+    fn try_write_to_clipboard(&self, item: ClipboardItem) -> anyhow::Result<()> {
+        self.inner.try_write_to_clipboard(item)
     }
 
     fn read_from_primary(&self) -> Option<ClipboardItem> {

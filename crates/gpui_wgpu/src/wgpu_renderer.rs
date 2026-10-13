@@ -1,3 +1,4 @@
+use crate::surface_frame::SurfaceFrame;
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
@@ -1118,24 +1119,15 @@ impl WgpuRenderer {
 
         self.atlas.before_frame();
 
-        let frame = match self
+        let (frame, suboptimal) = match self
             .resources()
             .surface
             .as_ref()
             .expect("Configured surface missing")
             .get_current_texture()
         {
-            wgpu::CurrentSurfaceTexture::Success(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
-                // Textures must be destroyed before the surface can be reconfigured.
-                drop(frame);
-                let surface_config = self.surface_config.clone();
-                let resources = self.resources_mut();
-                if let Some(surface) = &resources.surface {
-                    surface.configure(&resources.device, &surface_config);
-                }
-                return false;
-            }
+            wgpu::CurrentSurfaceTexture::Success(frame) => (SurfaceFrame::new(frame), false),
+            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => (SurfaceFrame::new(frame), true),
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 let surface_config = self.surface_config.clone();
                 let resources = self.resources_mut();
@@ -1158,7 +1150,7 @@ impl WgpuRenderer {
         self.ensure_intermediate_textures();
 
         let frame_view = frame
-            .texture
+            .texture()
             .create_view(&wgpu::TextureViewDescriptor::default());
 
         let gamma_params = GammaParams {
@@ -1330,8 +1322,7 @@ impl WgpuRenderer {
                         "instance buffer size grew too large: {}",
                         self.instance_buffer_capacity
                     );
-                    frame.present();
-                    return true;
+                    return self.present_frame(frame, suboptimal);
                 }
                 self.grow_instance_buffer();
                 continue;
@@ -1340,9 +1331,22 @@ impl WgpuRenderer {
             self.resources()
                 .queue
                 .submit(std::iter::once(encoder.finish()));
-            frame.present();
-            return true;
+            return self.present_frame(frame, suboptimal);
         }
+    }
+
+    fn present_frame(&mut self, frame: SurfaceFrame, suboptimal: bool) -> bool {
+        frame.present();
+        if self.device_lost() {
+            return false;
+        }
+        if suboptimal {
+            let resources = self.resources();
+            if let Some(surface) = &resources.surface {
+                surface.configure(&resources.device, &self.surface_config);
+            }
+        }
+        true
     }
 
     fn draw_quads(

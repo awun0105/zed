@@ -1010,10 +1010,14 @@ impl X11Window {
 
 impl X11WindowStatePtr {
     pub fn should_close(&self) -> bool {
-        let mut cb = self.callbacks.borrow_mut();
-        if let Some(mut should_close) = cb.should_close.take() {
+        let should_close = self.callbacks.borrow_mut().should_close.take();
+        if let Some(mut should_close) = should_close {
             let result = (should_close)();
-            cb.should_close = Some(should_close);
+            let mut callbacks = self.callbacks.borrow_mut();
+            if callbacks.should_close.is_none() {
+                callbacks.should_close = Some(should_close);
+            }
+            drop(callbacks);
             result
         } else {
             true
@@ -1128,8 +1132,8 @@ impl X11WindowStatePtr {
             }
         }
 
-        let mut callbacks = self.callbacks.borrow_mut();
-        if let Some(fun) = callbacks.close.take() {
+        let close = self.callbacks.borrow_mut().close.take();
+        if let Some(fun) = close {
             fun()
         }
     }

@@ -1931,6 +1931,13 @@ impl Window {
         self.handle
     }
 
+    /// Returns the native Wayland proxy, which tracks destruction without borrowing a raw pointer.
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    pub fn wayland_surface(&self) -> Option<wayland_client::protocol::wl_surface::WlSurface> {
+        self.platform_window.wayland_surface()
+    }
+
+
     /// Mark the window as dirty, scheduling it to be redrawn on the next frame.
     pub fn refresh(&mut self) {
         if self.invalidator.not_drawing() {

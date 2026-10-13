@@ -22,6 +22,7 @@ use std::{
     borrow::Cow,
     cell::RefCell,
     collections::{HashMap, hash_map::Entry},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -47,8 +48,9 @@ use x11rb::{
     wrapper::ConnectionExt as _,
 };
 
-use gpui::{ClipboardItem, Image, ImageFormat, hash};
+use gpui::{ClipboardEntry, ClipboardItem, Image, ImageFormat, hash};
 use strum::IntoEnumIterator;
+use url::Url;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -77,8 +79,9 @@ x11rb::atom_manager! {
         TEXT,
         TEXT_MIME_UNKNOWN: b"text/plain",
 
-        // HTML: b"text/html",
-        // URI_LIST: b"text/uri-list",
+        FILE_LIST: b"text/uri-list",
+        GNOME_COPY_FILES: b"x-special/gnome-copied-files",
+        NAUTILUS_FILE_LIST: b"x-special/nautilus-clipboard",
 
         PNG__MIME: ImageFormat::mime_type(ImageFormat::Png ).as_bytes(),
         JPEG_MIME: ImageFormat::mime_type(ImageFormat::Jpeg).as_bytes(),
@@ -990,6 +993,47 @@ impl Clipboard {
         self.inner.write(data, selection, wait)
     }
 
+    pub(crate) fn set_item(
+        &self,
+        item: &ClipboardItem,
+        selection: ClipboardKind,
+        wait: WaitConfig,
+    ) -> Result<()> {
+        let mut data = Vec::new();
+        let atoms = self.inner.atoms;
+        let mut text = String::new();
+        let mut has_text = false;
+
+        for entry in item.entries() {
+            match entry {
+                ClipboardEntry::String(value) => {
+                    has_text = true;
+                    text.push_str(value.text());
+                }
+                ClipboardEntry::Image(image) => data.push(ClipboardData {
+                    bytes: image.bytes().to_vec(),
+                    format: self.image_format_atom(image.format()),
+                }),
+                ClipboardEntry::ExternalPaths(paths) => {
+                    data.extend(file_uri_list_to_clipboard_data(paths.paths(), atoms)?);
+                }
+            }
+        }
+
+        if has_text {
+            data.push(ClipboardData {
+                bytes: text.into_bytes(),
+                format: atoms.UTF8_STRING,
+            });
+        }
+
+        if data.is_empty() {
+            return Err(Error::unknown("clipboard item has no transferable data"));
+        }
+
+        self.inner.write(data, selection, wait)
+    }
+
     fn image_format_atom(&self, format: ImageFormat) -> Atom {
         match format {
             ImageFormat::Png => self.inner.atoms.PNG__MIME,
@@ -1014,7 +1058,7 @@ impl Clipboard {
         let format = self.image_format_atom(image.format);
         let data = vec![ClipboardData {
             bytes: image.bytes,
-            format: self.inner.atoms.PNG__MIME,
+            format,
         }];
         self.inner.write(data, selection, wait)
     }
@@ -1136,6 +1180,66 @@ fn into_unknown<E: std::fmt::Display>(error: E) -> Error {
     Error::Unknown {
         description: error.to_string(),
     }
+}
+
+fn file_uri_list_to_clipboard_data(paths: &[PathBuf], atoms: Atoms) -> Result<Vec<ClipboardData>> {
+    if paths.is_empty() {
+        return Err(Error::unknown("clipboard file list is empty"));
+    }
+
+    let uris = paths
+        .iter()
+        .map(|path| {
+            Url::from_file_path(path)
+                .map(|url| url.to_string())
+                .map_err(|_| {
+                    Error::unknown(format!("cannot convert {} to a file URI", path.display()))
+                })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let plain_paths = paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let plain_crlf = plain_paths.join("\r\n");
+    let plain_lf = plain_paths.join("\n");
+    let uri_crlf = uris.join("\r\n");
+    let gnome = format!("copy\n{}", uris.join("\n"));
+
+    Ok(vec![
+        ClipboardData {
+            bytes: plain_crlf.as_bytes().to_vec(),
+            format: atoms.TEXT_MIME_UNKNOWN,
+        },
+        ClipboardData {
+            bytes: plain_crlf.as_bytes().to_vec(),
+            format: atoms.UTF8_MIME_0,
+        },
+        ClipboardData {
+            bytes: plain_lf.as_bytes().to_vec(),
+            format: atoms.STRING,
+        },
+        ClipboardData {
+            bytes: plain_lf.as_bytes().to_vec(),
+            format: atoms.TEXT,
+        },
+        ClipboardData {
+            bytes: plain_lf.as_bytes().to_vec(),
+            format: atoms.UTF8_STRING,
+        },
+        ClipboardData {
+            bytes: uri_crlf.as_bytes().to_vec(),
+            format: atoms.FILE_LIST,
+        },
+        ClipboardData {
+            bytes: gnome.as_bytes().to_vec(),
+            format: atoms.GNOME_COPY_FILES,
+        },
+        ClipboardData {
+            bytes: gnome.into_bytes(),
+            format: atoms.NAUTILUS_FILE_LIST,
+        },
+    ])
 }
 
 /// Clipboard selection

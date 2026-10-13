@@ -7,15 +7,15 @@ use std::{
 };
 
 use collections::{FxHashMap, HashMap};
-use futures::channel::oneshot::Receiver;
+use futures::{FutureExt, channel::oneshot::Receiver};
 
 use raw_window_handle as rwh;
 use wayland_backend::client::ObjectId;
-use wayland_client::WEnum;
 use wayland_client::{
     Proxy,
     protocol::{wl_output, wl_seat, wl_surface},
 };
+use wayland_client::{WEnum, globals::GlobalListContents};
 use wayland_protocols::wp::viewporter::client::wp_viewport;
 use wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1;
 use wayland_protocols::xdg::shell::client::xdg_popup;
@@ -93,7 +93,126 @@ struct InProgressConfigure {
     tiling: Tiling,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VisibilityPhase {
+    Visible,
+    Draining(u64),
+    Unmapping(u64),
+    Hidden,
+    Configuring(u64),
+    Remapping(u64),
+}
+
+impl VisibilityPhase {
+    fn can_acknowledge_configure(self) -> bool {
+        !matches!(self, Self::Unmapping(_) | Self::Hidden)
+    }
+
+    fn can_draw(self, configured: bool) -> bool {
+        configured
+            && matches!(
+                self,
+                Self::Visible | Self::Configuring(_) | Self::Remapping(_)
+            )
+    }
+}
+
+struct RetainedVisibility {
+    sequence: u64,
+    desired: bool,
+    phase: VisibilityPhase,
+    waiter: Option<(
+        u64,
+        futures::channel::oneshot::Sender<anyhow::Result<(u64, bool)>>,
+    )>,
+}
+
+impl Default for RetainedVisibility {
+    fn default() -> Self {
+        Self {
+            sequence: 0,
+            desired: true,
+            phase: VisibilityPhase::Visible,
+            waiter: None,
+        }
+    }
+}
+
+impl RetainedVisibility {
+    fn request(&mut self, visible: bool) -> Receiver<anyhow::Result<(u64, bool)>> {
+        if let Some((_, waiter)) = self.waiter.take() {
+            let _ = waiter.send(Err(anyhow::anyhow!("Window visibility request superseded")));
+        }
+        self.sequence = self.sequence.wrapping_add(1);
+        self.desired = visible;
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        self.waiter = Some((self.sequence, sender));
+        receiver
+    }
+
+    fn begin_unmap(&mut self) -> u64 {
+        self.sequence = self.sequence.wrapping_add(1);
+        let transition = self.sequence;
+        self.phase = VisibilityPhase::Draining(transition);
+        transition
+    }
+
+    fn complete(&mut self) {
+        let visible = self.phase == VisibilityPhase::Visible;
+        if !matches!(
+            self.phase,
+            VisibilityPhase::Visible | VisibilityPhase::Hidden
+        ) || visible != self.desired
+        {
+            return;
+        }
+        if let Some((generation, waiter)) = self.waiter.take() {
+            let _ = waiter.send(Ok((generation, visible)));
+        }
+    }
+
+    fn processed(&mut self, transition: u64, visible: bool) -> bool {
+        let expected = if visible {
+            VisibilityPhase::Remapping(transition)
+        } else {
+            VisibilityPhase::Unmapping(transition)
+        };
+        if self.phase != expected {
+            return false;
+        }
+        self.phase = if visible {
+            VisibilityPhase::Visible
+        } else {
+            VisibilityPhase::Hidden
+        };
+        true
+    }
+
+    fn fail_restore(&mut self, error: anyhow::Error) -> u64 {
+        self.fail(error);
+        self.desired = false;
+        self.begin_unmap()
+    }
+
+    fn fail(&mut self, error: anyhow::Error) {
+        if let Some((_, waiter)) = self.waiter.take() {
+            let _ = waiter.send(Err(error));
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct VisibilitySync {
+    pub surface: ObjectId,
+    pub transition: u64,
+    pub visible: bool,
+}
+
 pub struct WaylandWindowState {
+    visibility: RetainedVisibility,
+    retiring_surface: Option<futures::future::Shared<gpui::Task<()>>>,
+    title: String,
+    minimum_size: Option<Size<Pixels>>,
     surface_state: WaylandSurfaceState,
     acknowledged_first_configure: bool,
     parent: Option<WaylandWindowStatePtr>,
@@ -107,9 +226,12 @@ pub struct WaylandWindowState {
     viewport: Option<wp_viewport::WpViewport>,
     outputs: HashMap<ObjectId, Output>,
     display: Option<(ObjectId, Output)>,
+    preferred_output: Option<wl_output::WlOutput>,
     globals: Globals,
     renderer: WgpuRenderer,
     bounds: Bounds<Pixels>,
+    fixed_outer_size: Option<Size<Pixels>>,
+    fixed_geometry_size: Option<Size<i32>>,
     scale: f32,
     input_handler: Option<PlatformInputHandler>,
     decorations: WindowDecorations,
@@ -539,6 +661,26 @@ pub struct WaylandWindowStatePtr {
 }
 
 impl WaylandWindowState {
+    fn fullscreen_output(&self) -> Option<&wl_output::WlOutput> {
+        self.preferred_output.as_ref().filter(|output| {
+            let Some(global_name) = output.data::<u32>() else {
+                return false;
+            };
+            output.is_alive()
+                && self
+                    .globals
+                    .registry
+                    .data::<GlobalListContents>()
+                    .is_some_and(|globals| {
+                        globals.with_list(|list| {
+                            list.iter().any(|global| {
+                                global.name == *global_name && global.interface == "wl_output"
+                            })
+                        })
+                    })
+        })
+    }
+
     pub(crate) fn new(
         handle: AnyWindowHandle,
         surface: wl_surface::WlSurface,
@@ -551,6 +693,7 @@ impl WaylandWindowState {
         compositor_gpu: Option<CompositorGpuHint>,
         options: WindowParams,
         parent: Option<WaylandWindowStatePtr>,
+        preferred_output: Option<wl_output::WlOutput>,
     ) -> anyhow::Result<Self> {
         let renderer = {
             let raw_window = RawWindow {
@@ -575,7 +718,11 @@ impl WaylandWindowState {
         };
 
         if let WaylandSurfaceState::Xdg(ref xdg_state) = surface_state {
-            if let Some(title) = options.titlebar.and_then(|titlebar| titlebar.title) {
+            if let Some(title) = options
+                .titlebar
+                .as_ref()
+                .and_then(|titlebar| titlebar.title.as_ref())
+            {
                 xdg_state.toplevel.set_title(title.to_string());
             }
 
@@ -591,7 +738,16 @@ impl WaylandWindowState {
                 .set_max_size(max_texture_size, max_texture_size);
         }
 
-        Ok(Self {
+        let mut state = Self {
+            visibility: RetainedVisibility::default(),
+            retiring_surface: None,
+            title: options
+                .titlebar
+                .as_ref()
+                .and_then(|titlebar| titlebar.title.as_ref())
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            minimum_size: options.window_min_size,
             surface_state,
             acknowledged_first_configure: false,
             parent,
@@ -603,8 +759,11 @@ impl WaylandWindowState {
             globals,
             outputs: HashMap::default(),
             display: None,
+            preferred_output,
             renderer,
             bounds: options.bounds,
+            fixed_outer_size: (!options.is_resizable).then_some(options.bounds.size),
+            fixed_geometry_size: None,
             scale: 1.0,
             input_handler: None,
             decorations: WindowDecorations::Client,
@@ -626,7 +785,30 @@ impl WaylandWindowState {
             window_controls: WindowControls::default(),
             client_inset: None,
             accesskit_adapter: None,
-        })
+        };
+        state.update_size_constraints();
+        Ok(state)
+    }
+
+    fn update_size_constraints(&mut self) {
+        let Some(outer_size) = self.fixed_outer_size else {
+            return;
+        };
+        let geometry_size = fixed_window_geometry_size(
+            outer_size,
+            self.inset(),
+            self.tiling,
+            self.renderer.max_texture_size(),
+            self.scale,
+        );
+        if self.fixed_geometry_size == Some(geometry_size) {
+            return;
+        }
+        if let Some(toplevel) = self.surface_state.toplevel() {
+            toplevel.set_min_size(geometry_size.width, geometry_size.height);
+            toplevel.set_max_size(geometry_size.width, geometry_size.height);
+            self.fixed_geometry_size = Some(geometry_size);
+        }
     }
 
     pub fn is_transparent(&self) -> bool {
@@ -680,6 +862,34 @@ pub enum ImeInput {
 impl Drop for WaylandWindow {
     fn drop(&mut self) {
         let mut state = self.0.state.borrow_mut();
+        state.visibility.fail(anyhow::anyhow!(
+            "Window closed during visibility transition"
+        ));
+        state.visibility.phase = VisibilityPhase::Hidden;
+        let retirement = state.retiring_surface.take();
+        let executor = state.globals.executor.clone();
+        drop(state);
+        if let Some(retirement) = retirement {
+            let window = self.0.clone();
+            executor
+                .spawn(async move {
+                    retirement.await;
+                    window.destroy_window();
+                })
+                .detach();
+        } else {
+            self.0.destroy_window();
+        }
+    }
+}
+
+impl WaylandWindowStatePtr {
+    fn destroy_window(&self) {
+        let mut state = self.state.borrow_mut();
+        state.visibility.fail(anyhow::anyhow!(
+            "Window closed during visibility transition"
+        ));
+        state.visibility.phase = VisibilityPhase::Hidden;
         let surface_id = state.surface.id();
         if let Some(parent) = state.parent.as_ref() {
             parent.state.borrow_mut().children.remove(&surface_id);
@@ -713,7 +923,7 @@ impl Drop for WaylandWindow {
         // The wl_surface itself should always be destroyed last.
         state.surface.destroy();
 
-        let state_ptr = self.0.clone();
+        let state_ptr = self.clone();
         state
             .globals
             .executor
@@ -754,7 +964,7 @@ impl WaylandWindow {
             &params,
             parent.clone(),
             popup_grab,
-            target_output,
+            target_output.clone(),
         )?;
 
         if let Some(fractional_scale_manager) = globals.fractional_scale_manager.as_ref() {
@@ -779,6 +989,7 @@ impl WaylandWindow {
                 compositor_gpu,
                 params,
                 parent,
+                target_output,
             )?)),
             callbacks: Rc::new(RefCell::new(Callbacks::default())),
         });
@@ -838,8 +1049,153 @@ impl WaylandWindowStatePtr {
         state.children.values().any(|&blocking| blocking)
     }
 
+    fn visibility_supported(&self) -> bool {
+        let state = self.state.borrow();
+        matches!(&state.surface_state, WaylandSurfaceState::Xdg(xdg) if xdg.dialog.is_none())
+            && state.children.is_empty()
+    }
+
+    fn request_visibility(
+        &self,
+        visible: bool,
+    ) -> anyhow::Result<Receiver<anyhow::Result<(u64, bool)>>> {
+        anyhow::ensure!(
+            self.visibility_supported(),
+            "Close child dialogs and popups before hiding this window"
+        );
+        let receiver = self.state.borrow_mut().visibility.request(visible);
+        self.advance_visibility();
+        Ok(receiver)
+    }
+
+    fn visibility_sync(state: &WaylandWindowState, transition: u64, visible: bool) {
+        let connection = wayland_client::Connection::from_backend(
+            state
+                .surface
+                .backend()
+                .upgrade()
+                .expect("Live surface connection required"),
+        );
+        connection.display().sync(
+            &state.globals.qh,
+            VisibilitySync {
+                surface: state.surface.id(),
+                transition,
+                visible,
+            },
+        );
+    }
+
+    fn unmap_surface(&self, transition: u64) {
+        let mut state = self.state.borrow_mut();
+        let surface = state.renderer.take_surface_for_visibility();
+        let background = state
+            .client
+            .get_client()
+            .borrow()
+            .common
+            .background_executor
+            .clone();
+        let foreground = state.globals.executor.clone();
+        let window = self.clone();
+        let retirement = background
+            .spawn(async move {
+                drop(surface);
+            })
+            .shared();
+        state.retiring_surface = Some(retirement.clone());
+        drop(state);
+        foreground
+            .spawn(async move {
+                retirement.await;
+                let mut state = window.state.borrow_mut();
+                state.retiring_surface = None;
+                if state.visibility.phase != VisibilityPhase::Draining(transition) {
+                    return;
+                }
+                state.surface.attach(None, 0, 0);
+                state.surface.commit();
+                state.visibility.phase = VisibilityPhase::Unmapping(transition);
+                Self::visibility_sync(&state, transition, false);
+            })
+            .detach();
+    }
+
+    fn advance_visibility(&self) {
+        let mut state = self.state.borrow_mut();
+        state.visibility.complete();
+        match (state.visibility.phase, state.visibility.desired) {
+            (VisibilityPhase::Visible, false) => {
+                let transition = state.visibility.begin_unmap();
+                drop(state);
+                self.unmap_surface(transition);
+            }
+            (VisibilityPhase::Hidden, true) => {
+                state.visibility.sequence = state.visibility.sequence.wrapping_add(1);
+                let transition = state.visibility.sequence;
+                state.visibility.phase = VisibilityPhase::Configuring(transition);
+                state.acknowledged_first_configure = false;
+                state.in_progress_configure = None;
+                state.renderer_presented = false;
+                state.resize_throttle = false;
+                state.fixed_geometry_size = None;
+                if let WaylandSurfaceState::Xdg(xdg) = &state.surface_state {
+                    xdg.toplevel.set_title(state.title.clone());
+                    if let Some(app_id) = &state.app_id {
+                        xdg.toplevel.set_app_id(app_id.clone());
+                    }
+                    let parent = state.parent.as_ref().and_then(|parent| parent.toplevel());
+                    xdg.toplevel.set_parent(parent.as_ref());
+                    if let Some(minimum) = state.minimum_size {
+                        xdg.toplevel.set_min_size(
+                            f32::from(minimum.width) as i32,
+                            f32::from(minimum.height) as i32,
+                        );
+                    }
+                    let maximum = state.renderer.max_texture_size() as i32;
+                    xdg.toplevel.set_max_size(maximum, maximum);
+                    if state.maximized {
+                        xdg.toplevel.set_maximized();
+                    }
+                    if state.fullscreen {
+                        xdg.toplevel.set_fullscreen(state.fullscreen_output());
+                    }
+                    if let Some(decoration) = &xdg.decoration {
+                        decoration.set_mode(state.decorations.to_xdg());
+                    }
+                }
+                state.update_size_constraints();
+                state.surface.commit();
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn visibility_processed(&self, sync: &VisibilitySync) {
+        let mut state = self.state.borrow_mut();
+        if state.surface.id() != sync.surface
+            || !state.visibility.processed(sync.transition, sync.visible)
+        {
+            return;
+        }
+        if !sync.visible {
+            state.acknowledged_first_configure = false;
+            state.in_progress_configure = None;
+            state.renderer_presented = false;
+        }
+        drop(state);
+        self.advance_visibility();
+    }
+
     pub fn frame(&self) {
         let mut state = self.state.borrow_mut();
+        if !state
+            .visibility
+            .phase
+            .can_draw(state.acknowledged_first_configure)
+        {
+            return;
+        }
         state.surface.frame(&state.globals.qh, state.surface.id());
         state.resize_throttle = false;
         let force_render = state.force_render_after_recovery;
@@ -882,6 +1238,17 @@ impl WaylandWindowStatePtr {
     pub fn handle_xdg_surface_event(&self, event: xdg_surface::Event) {
         if let xdg_surface::Event::Configure { serial } = event {
             {
+                let state = self.state.borrow();
+                // The null-buffer commit invalidates old serials before its sync callback arrives.
+                if !state.visibility.phase.can_acknowledge_configure() {
+                    return;
+                }
+                if matches!(state.visibility.phase, VisibilityPhase::Draining(_)) {
+                    state.surface_state.ack_configure(serial);
+                    return;
+                }
+            }
+            {
                 let mut state = self.state.borrow_mut();
                 if let Some(window_controls) = state.in_progress_window_controls.take() {
                     state.window_controls = window_controls;
@@ -901,6 +1268,7 @@ impl WaylandWindowStatePtr {
                     state.fullscreen = configure.fullscreen;
                     state.maximized = configure.maximized;
                     state.tiling = configure.tiling;
+                    state.update_size_constraints();
                     // Limit interactive resizes to once per vblank
                     if configure.resizing && state.resize_throttle {
                         state.surface_state.ack_configure(serial);
@@ -945,6 +1313,43 @@ impl WaylandWindowStatePtr {
                 window_geometry.size.height,
             );
 
+            if matches!(state.visibility.phase, VisibilityPhase::Configuring(_))
+                && !state.acknowledged_first_configure
+            {
+                let raw = RawWindow {
+                    window: state.surface.id().as_ptr().cast::<c_void>(),
+                    display: state
+                        .surface
+                        .backend()
+                        .upgrade()
+                        .unwrap()
+                        .display_ptr()
+                        .cast::<c_void>(),
+                };
+                let result = if state.renderer.device_lost() {
+                    state.renderer.recover(&raw)
+                } else {
+                    let gpu = state.client.get_client().borrow().gpu_context.clone();
+                    let gpu = gpu.borrow();
+                    gpu.as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("GPU unavailable during window restore"))
+                        .and_then(|gpu| {
+                            let config = WgpuSurfaceConfig {
+                                size: state.renderer.viewport_size(),
+                                transparent: state.is_transparent(),
+                                preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
+                            };
+                            state.renderer.replace_surface(&raw, config, &gpu.instance)
+                        })
+                };
+                if let Err(error) = result {
+                    let transition = state.visibility.fail_restore(error);
+                    drop(state);
+                    self.unmap_surface(transition);
+                    return;
+                }
+                state.force_render_after_recovery = true;
+            }
             let request_frame_callback = !state.acknowledged_first_configure;
             if request_frame_callback {
                 state.acknowledged_first_configure = true;
@@ -958,7 +1363,11 @@ impl WaylandWindowStatePtr {
         if let zxdg_toplevel_decoration_v1::Event::Configure { mode } = event {
             match mode {
                 WEnum::Value(zxdg_toplevel_decoration_v1::Mode::ServerSide) => {
-                    self.state.borrow_mut().decorations = WindowDecorations::Server;
+                    {
+                        let mut state = self.state.borrow_mut();
+                        state.decorations = WindowDecorations::Server;
+                        state.update_size_constraints();
+                    }
                     let callback = self.callbacks.borrow_mut().appearance_changed.take();
                     if let Some(mut fun) = callback {
                         fun();
@@ -966,7 +1375,11 @@ impl WaylandWindowStatePtr {
                     }
                 }
                 WEnum::Value(zxdg_toplevel_decoration_v1::Mode::ClientSide) => {
-                    self.state.borrow_mut().decorations = WindowDecorations::Client;
+                    {
+                        let mut state = self.state.borrow_mut();
+                        state.decorations = WindowDecorations::Client;
+                        state.update_size_constraints();
+                    }
                     // Update background to be transparent
                     let callback = self.callbacks.borrow_mut().appearance_changed.take();
                     if let Some(mut fun) = callback {
@@ -1271,6 +1684,7 @@ impl WaylandWindowStatePtr {
             }
             if let Some(scale) = scale {
                 state.scale = scale;
+                state.update_size_constraints();
             }
             let device_bounds = state.bounds.to_device_pixels(state.scale);
             state.renderer.update_drawable_size(device_bounds.size);
@@ -1428,6 +1842,10 @@ impl rwh::HasDisplayHandle for WaylandWindow {
 }
 
 impl PlatformWindow for WaylandWindow {
+    fn wayland_surface(&self) -> Option<wl_surface::WlSurface> {
+        Some(self.0.surface())
+    }
+
     fn bounds(&self) -> Bounds<Pixels> {
         self.borrow().bounds
     }
@@ -1466,7 +1884,7 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn resize(&mut self, size: Size<Pixels>) {
-        let state = self.borrow();
+        let mut state = self.borrow_mut();
         let state_ptr = self.0.clone();
 
         // A popup's placement is the compositor's, so a resize re-runs the positioner and the
@@ -1484,6 +1902,11 @@ impl PlatformWindow for WaylandWindow {
                     .reposition_popup(&state.globals, size, parent_geometry);
             }
             return;
+        }
+
+        if state.fixed_outer_size.is_some() {
+            state.fixed_outer_size = Some(size);
+            state.update_size_constraints();
         }
 
         // Keep window geometry consistent with configure handling. On Wayland, window geometry is
@@ -1568,6 +1991,20 @@ impl PlatformWindow for WaylandWindow {
         None
     }
 
+    fn retained_visibility(&self) -> Option<bool> {
+        self.0.visibility_supported().then(|| {
+            let state = self.borrow();
+            state.visibility.phase == VisibilityPhase::Visible && state.acknowledged_first_configure
+        })
+    }
+
+    fn set_retained_visibility(
+        &self,
+        visible: bool,
+    ) -> anyhow::Result<Receiver<anyhow::Result<(u64, bool)>>> {
+        self.0.request_visibility(visible)
+    }
+
     fn activate(&self) {
         // Try to request an activation token. Even though the activation is likely going to be rejected,
         // KWin and Mutter can use the app_id to visually indicate we're requesting attention.
@@ -1596,7 +2033,9 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn set_title(&mut self, title: &str) {
-        if let Some(toplevel) = self.borrow().surface_state.toplevel() {
+        let mut state = self.borrow_mut();
+        state.title = title.to_owned();
+        if let Some(toplevel) = state.surface_state.toplevel() {
             toplevel.set_title(title.to_string());
         }
     }
@@ -1650,7 +2089,7 @@ impl PlatformWindow for WaylandWindow {
         let state = self.borrow();
         if let Some(toplevel) = state.surface_state.toplevel() {
             if !state.fullscreen {
-                toplevel.set_fullscreen(None);
+                toplevel.set_fullscreen(state.fullscreen_output());
             } else {
                 toplevel.unset_fullscreen();
             }
@@ -1706,6 +2145,13 @@ impl PlatformWindow for WaylandWindow {
 
     fn draw(&self, scene: &Scene) {
         let mut state = self.borrow_mut();
+        if !state
+            .visibility
+            .phase
+            .can_draw(state.acknowledged_first_configure)
+        {
+            return;
+        }
 
         if state.renderer.device_lost() {
             let raw_window = RawWindow {
@@ -1730,6 +2176,12 @@ impl PlatformWindow for WaylandWindow {
         }
 
         state.renderer_presented = state.renderer.draw(scene);
+        if state.renderer_presented
+            && let VisibilityPhase::Configuring(transition) = state.visibility.phase
+        {
+            state.visibility.phase = VisibilityPhase::Remapping(transition);
+            WaylandWindowStatePtr::visibility_sync(&state, transition, true);
+        }
 
         if state.renderer.needs_redraw() {
             state.force_render_after_recovery = true;
@@ -1738,6 +2190,13 @@ impl PlatformWindow for WaylandWindow {
 
     fn completed_frame(&self) {
         let mut state = self.borrow_mut();
+        if !state
+            .visibility
+            .phase
+            .can_draw(state.acknowledged_first_configure)
+        {
+            return;
+        }
 
         // Work around a bug in old versions of wlroots where committing without a buffer attached
         // can cause invalid synchronization that leads to graphical corruption.
@@ -1776,6 +2235,9 @@ impl PlatformWindow for WaylandWindow {
 
     fn start_window_resize(&self, edge: gpui::ResizeEdge) {
         let state = self.borrow();
+        if state.fixed_outer_size.is_some() {
+            return;
+        }
         if let Some(toplevel) = state.surface_state.toplevel() {
             toplevel.resize(
                 &state.globals.seat,
@@ -1835,7 +2297,13 @@ impl PlatformWindow for WaylandWindow {
         // Commit so the new input region applies immediately. Otherwise it
         // waits for the next frame, which could be the very click we want to
         // allow passing through.
-        state.surface.commit();
+        if state
+            .visibility
+            .phase
+            .can_draw(state.acknowledged_first_configure)
+        {
+            state.surface.commit();
+        }
     }
 
     fn window_decorations(&self) -> Decorations {
@@ -1854,6 +2322,7 @@ impl PlatformWindow for WaylandWindow {
             Some(decoration) => {
                 decoration.set_mode(decorations.to_xdg());
                 state.decorations = decorations;
+                state.update_size_constraints();
                 update_window(state);
             }
             None => {
@@ -1863,6 +2332,7 @@ impl PlatformWindow for WaylandWindow {
                     );
                 }
                 state.decorations = WindowDecorations::Client;
+                state.update_size_constraints();
                 update_window(state);
             }
         }
@@ -1876,6 +2346,7 @@ impl PlatformWindow for WaylandWindow {
         let mut state = self.borrow_mut();
         if Some(inset) != state.client_inset {
             state.client_inset = Some(inset);
+            state.update_size_constraints();
             update_window(state);
         }
     }
@@ -2081,4 +2552,338 @@ fn inset_by_tiling(mut bounds: Bounds<Pixels>, inset: Pixels, tiling: Tiling) ->
     }
 
     bounds
+}
+
+fn fixed_window_geometry_size(
+    outer_size: Size<Pixels>,
+    inset: Pixels,
+    tiling: Tiling,
+    max_texture_size: u32,
+    scale: f32,
+) -> Size<i32> {
+    let limit = (max_texture_size as f32 / scale.max(f32::EPSILON)).max(1.0);
+    let outer_size = outer_size.map(|value| px(f32::from(value).clamp(1.0, limit)));
+    inset_by_tiling(
+        Bounds {
+            origin: Point::default(),
+            size: outer_size,
+        },
+        inset,
+        tiling,
+    )
+    .size
+    .map(|value| (f32::from(value) as i32).max(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_size_tracks_programmatic_expansion_in_logical_pixels() {
+        for height in [395.0, 440.0, 520.0, 395.0] {
+            assert_eq!(
+                fixed_window_geometry_size(
+                    size(px(330.0), px(height)),
+                    px(0.0),
+                    Tiling::default(),
+                    8192,
+                    2.0,
+                ),
+                size(330, height as i32),
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_size_uses_the_same_insets_as_xdg_window_geometry() {
+        for tiling in [
+            Tiling::default(),
+            Tiling::tiled(),
+            Tiling {
+                top: true,
+                left: true,
+                ..Tiling::default()
+            },
+        ] {
+            let outer = size(px(330.0), px(395.0));
+            let constrained = fixed_window_geometry_size(outer, px(8.0), tiling, 8192, 2.0);
+            assert_eq!(
+                compute_outer_size(
+                    px(8.0),
+                    Some(constrained.map(|value| px(value as f32))),
+                    tiling,
+                ),
+                Some(outer),
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_size_stays_positive_and_within_the_scaled_texture_limit() {
+        assert_eq!(
+            fixed_window_geometry_size(
+                size(px(10000.0), px(10000.0)),
+                px(8.0),
+                Tiling::default(),
+                8192,
+                2.0,
+            ),
+            size(4080, 4080),
+        );
+        assert_eq!(
+            fixed_window_geometry_size(
+                size(px(0.0), px(10.0)),
+                px(8.0),
+                Tiling::default(),
+                8192,
+                1.0,
+            ),
+            size(1, 1),
+        );
+    }
+}
+
+#[cfg(test)]
+mod retained_visibility_tests {
+    use super::{RetainedVisibility, VisibilityPhase};
+    use futures::executor::block_on;
+
+    #[test]
+    fn configure_acknowledgements_remain_valid_while_draining() {
+        assert!(VisibilityPhase::Visible.can_acknowledge_configure());
+        assert!(VisibilityPhase::Draining(1).can_acknowledge_configure());
+        assert!(!VisibilityPhase::Draining(1).can_draw(true));
+    }
+
+    #[test]
+    fn queued_configures_are_discarded_after_the_unmap_commit() {
+        for phase in [VisibilityPhase::Unmapping(1), VisibilityPhase::Hidden] {
+            assert!(!phase.can_acknowledge_configure());
+            assert!(!phase.can_draw(true));
+        }
+    }
+
+    #[test]
+    fn a_fresh_restore_configure_is_required_before_drawing() {
+        for phase in [
+            VisibilityPhase::Configuring(2),
+            VisibilityPhase::Remapping(2),
+        ] {
+            assert!(phase.can_acknowledge_configure());
+            assert!(!phase.can_draw(false));
+            assert!(phase.can_draw(true));
+        }
+    }
+
+    #[test]
+    fn normal_unmap_still_begins_draining_before_acknowledgement() {
+        let mut visibility = RetainedVisibility::default();
+        let mut hidden = visibility.request(false);
+        let transition = visibility.begin_unmap();
+
+        assert_eq!(transition, 2);
+        assert_eq!(visibility.phase, VisibilityPhase::Draining(transition));
+        assert!(visibility.phase.can_acknowledge_configure());
+        assert!(!visibility.phase.can_draw(true));
+        visibility.complete();
+        assert!(hidden.try_recv().unwrap().is_none());
+        assert!(!visibility.processed(transition, false));
+
+        visibility.phase = VisibilityPhase::Unmapping(transition);
+        assert!(visibility.processed(transition, false));
+        visibility.complete();
+        assert_eq!(block_on(hidden).unwrap().unwrap(), (1, false));
+    }
+
+    #[test]
+    fn failed_restore_reports_error_and_unmaps_without_automatic_retry() {
+        let mut visibility = RetainedVisibility {
+            sequence: 2,
+            phase: VisibilityPhase::Configuring(2),
+            ..Default::default()
+        };
+        let shown = visibility.request(true);
+        let transition = visibility.fail_restore(anyhow::anyhow!("transient renderer failure"));
+
+        assert_eq!(
+            block_on(shown).unwrap().unwrap_err().to_string(),
+            "transient renderer failure"
+        );
+        assert_eq!(visibility.phase, VisibilityPhase::Draining(transition));
+        assert!(!visibility.desired);
+        assert!(!visibility.phase.can_draw(true));
+        assert!(!visibility.processed(transition, false));
+
+        visibility.phase = VisibilityPhase::Unmapping(transition);
+        assert!(!visibility.phase.can_acknowledge_configure());
+        assert!(visibility.processed(transition, false));
+        visibility.complete();
+        assert_eq!(visibility.phase, VisibilityPhase::Hidden);
+        assert!(!visibility.desired);
+        assert!(visibility.waiter.is_none());
+    }
+
+    #[test]
+    fn show_after_restore_failure_waits_for_unmap_and_fresh_presentation() {
+        let mut visibility = RetainedVisibility {
+            sequence: 2,
+            phase: VisibilityPhase::Configuring(2),
+            ..Default::default()
+        };
+        let failed = visibility.request(true);
+        let unmap = visibility.fail_restore(anyhow::anyhow!("transient renderer failure"));
+        assert!(block_on(failed).unwrap().is_err());
+        let mut shown = visibility.request(true);
+        visibility.complete();
+        assert!(shown.try_recv().unwrap().is_none());
+        assert!(!visibility.processed(unmap, true));
+
+        visibility.phase = VisibilityPhase::Unmapping(unmap);
+        assert!(visibility.processed(unmap, false));
+        visibility.complete();
+        assert_eq!(visibility.phase, VisibilityPhase::Hidden);
+        assert!(visibility.desired);
+        assert!(shown.try_recv().unwrap().is_none());
+
+        visibility.sequence = visibility.sequence.wrapping_add(1);
+        let remap = visibility.sequence;
+        visibility.phase = VisibilityPhase::Configuring(remap);
+        assert!(!visibility.phase.can_draw(false));
+        assert!(!visibility.processed(remap, true));
+        visibility.complete();
+        assert!(shown.try_recv().unwrap().is_none());
+
+        visibility.phase = VisibilityPhase::Remapping(remap);
+        assert!(visibility.processed(remap, true));
+        visibility.complete();
+        assert_eq!(block_on(shown).unwrap().unwrap(), (5, true));
+    }
+
+    #[test]
+    fn hide_after_restore_failure_waits_for_the_cleanup_sync() {
+        let mut visibility = RetainedVisibility {
+            sequence: 2,
+            phase: VisibilityPhase::Configuring(2),
+            ..Default::default()
+        };
+        let failed = visibility.request(true);
+        let transition = visibility.fail_restore(anyhow::anyhow!("transient renderer failure"));
+        assert!(block_on(failed).unwrap().is_err());
+        let mut hidden = visibility.request(false);
+
+        visibility.complete();
+        assert!(hidden.try_recv().unwrap().is_none());
+        assert!(!visibility.processed(transition, false));
+        visibility.phase = VisibilityPhase::Unmapping(transition);
+        assert!(visibility.processed(transition, false));
+        visibility.complete();
+        assert_eq!(block_on(hidden).unwrap().unwrap(), (5, false));
+    }
+
+    #[test]
+    fn repeated_restore_failures_require_new_explicit_requests() {
+        let mut visibility = RetainedVisibility {
+            phase: VisibilityPhase::Hidden,
+            desired: false,
+            ..Default::default()
+        };
+
+        for _ in 0..3 {
+            let shown = visibility.request(true);
+            visibility.sequence = visibility.sequence.wrapping_add(1);
+            visibility.phase = VisibilityPhase::Configuring(visibility.sequence);
+            let transition = visibility.fail_restore(anyhow::anyhow!("renderer still unavailable"));
+            assert!(block_on(shown).unwrap().is_err());
+            assert!(!visibility.desired);
+            assert!(visibility.waiter.is_none());
+
+            visibility.phase = VisibilityPhase::Unmapping(transition);
+            assert!(visibility.processed(transition, false));
+            visibility.complete();
+            assert_eq!(visibility.phase, VisibilityPhase::Hidden);
+            assert!(!visibility.desired);
+            assert!(visibility.waiter.is_none());
+        }
+    }
+
+    #[test]
+    fn unmap_receipt_waits_for_matching_compositor_transition() {
+        let mut visibility = RetainedVisibility::default();
+        let mut receipt = visibility.request(false);
+        visibility.phase = VisibilityPhase::Unmapping(2);
+        visibility.complete();
+        assert!(receipt.try_recv().unwrap().is_none());
+        assert!(!visibility.processed(1, false));
+        assert!(!visibility.processed(2, true));
+        assert!(visibility.processed(2, false));
+        visibility.complete();
+        assert_eq!(block_on(receipt).unwrap().unwrap(), (1, false));
+    }
+
+    #[test]
+    fn hide_then_restore_keeps_physical_unmap_before_remap() {
+        let mut visibility = RetainedVisibility::default();
+        let hidden = visibility.request(false);
+        visibility.phase = VisibilityPhase::Unmapping(2);
+        let mut shown = visibility.request(true);
+        assert!(block_on(hidden).unwrap().is_err());
+        assert!(visibility.processed(2, false));
+        visibility.complete();
+        assert!(shown.try_recv().unwrap().is_none());
+        visibility.phase = VisibilityPhase::Remapping(4);
+        assert!(visibility.processed(4, true));
+        visibility.complete();
+        assert_eq!(block_on(shown).unwrap().unwrap(), (2, true));
+    }
+
+    #[test]
+    fn configure_without_first_present_cannot_acknowledge_restore() {
+        let mut visibility = RetainedVisibility {
+            phase: VisibilityPhase::Hidden,
+            desired: false,
+            ..Default::default()
+        };
+        let mut shown = visibility.request(true);
+        visibility.phase = VisibilityPhase::Configuring(2);
+        assert!(!visibility.processed(2, true));
+        visibility.complete();
+        assert!(shown.try_recv().unwrap().is_none());
+        visibility.phase = VisibilityPhase::Remapping(2);
+        assert!(visibility.processed(2, true));
+        visibility.complete();
+        assert!(block_on(shown).unwrap().unwrap().1);
+    }
+
+    #[test]
+    fn queued_draw_and_completed_frame_are_blocked_through_unmap() {
+        for phase in [
+            VisibilityPhase::Draining(1),
+            VisibilityPhase::Unmapping(1),
+            VisibilityPhase::Hidden,
+        ] {
+            assert!(!phase.can_draw(true));
+            assert!(!phase.can_draw(false));
+        }
+        assert!(!VisibilityPhase::Configuring(1).can_draw(false));
+        assert!(VisibilityPhase::Configuring(1).can_draw(true));
+    }
+
+    #[test]
+    fn close_never_fabricates_a_visibility_acknowledgement() {
+        let mut visibility = RetainedVisibility::default();
+        let receipt = visibility.request(false);
+        visibility.fail(anyhow::anyhow!("window closed"));
+        assert!(block_on(receipt).unwrap().is_err());
+    }
+
+    #[test]
+    fn a_late_unmap_cannot_override_a_new_remap() {
+        let mut visibility = RetainedVisibility {
+            phase: VisibilityPhase::Remapping(8),
+            ..Default::default()
+        };
+        assert!(!visibility.processed(6, false));
+        assert_eq!(visibility.phase, VisibilityPhase::Remapping(8));
+    }
 }

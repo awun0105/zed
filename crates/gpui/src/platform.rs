@@ -795,6 +795,10 @@ pub enum TextInputStateChange {
 
 #[expect(missing_docs)]
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    fn wayland_surface(&self) -> Option<wayland_client::protocol::wl_surface::WlSurface> {
+        None
+    }
     fn bounds(&self) -> Bounds<Pixels>;
     fn is_maximized(&self) -> bool;
     fn window_bounds(&self) -> WindowBounds;
