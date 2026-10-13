@@ -93,6 +93,7 @@ pub(crate) struct WindowsWindowInner {
     system_settings: WindowsSystemSettings,
     pub(crate) handle: AnyWindowHandle,
     pub(crate) hide_title_bar: bool,
+    pub(crate) custom_frame: bool,
     pub(crate) is_movable: bool,
     pub(crate) is_resizable: bool,
     pub(crate) is_minimizable: bool,
@@ -213,7 +214,11 @@ impl WindowsWindowState {
         };
         (
             calculate_client_rect(
-                placement.rcNormalPosition,
+                translate_rect(
+                    placement.rcNormalPosition,
+                    workspace_offset(self.hwnd, self.display.get(), self.scale_factor.get()),
+                    1,
+                ),
                 &self.border_offset,
                 self.scale_factor.get(),
             ),
@@ -263,6 +268,7 @@ impl WindowsWindowInner {
             state,
             handle: context.handle,
             hide_title_bar: context.hide_title_bar,
+            custom_frame: context.custom_frame,
             is_movable: context.is_movable,
             is_resizable: context.is_resizable,
             is_minimizable: context.is_minimizable,
@@ -386,6 +392,7 @@ struct WindowCreateContext {
     inner: Option<Result<Rc<WindowsWindowInner>>>,
     handle: AnyWindowHandle,
     hide_title_bar: bool,
+    custom_frame: bool,
     display: WindowsDisplay,
     is_movable: bool,
     is_resizable: bool,
@@ -403,6 +410,10 @@ struct WindowCreateContext {
     directx_devices: DirectXDevices,
     invalidate_devices: Arc<AtomicBool>,
     parent_hwnd: Option<HWND>,
+}
+
+fn custom_frame_enabled(normal_window: bool, transparent_titlebar: Option<bool>) -> bool {
+    normal_window && transparent_titlebar == Some(true)
 }
 
 impl WindowsWindow {
@@ -450,6 +461,13 @@ impl WindowsWindow {
             .as_ref()
             .map(|titlebar| titlebar.appears_transparent)
             .unwrap_or(true);
+        let custom_frame = custom_frame_enabled(
+            params.kind == WindowKind::Normal,
+            params
+                .titlebar
+                .as_ref()
+                .map(|titlebar| titlebar.appears_transparent),
+        );
         let window_name = HSTRING::from(
             params
                 .titlebar
@@ -460,9 +478,14 @@ impl WindowsWindow {
         );
 
         let (mut dwexstyle, dwstyle) = if params.kind == WindowKind::PopUp {
-            (WS_EX_TOOLWINDOW, WINDOW_STYLE(0x0))
+            (WS_EX_TOOLWINDOW, WS_POPUP)
         } else {
             let mut dwstyle = WS_SYSMENU;
+            if hide_title_bar && !custom_frame {
+                dwstyle |= WS_POPUP;
+            } else {
+                dwstyle |= WS_CAPTION;
+            }
 
             if params.is_resizable {
                 dwstyle |= WS_THICKFRAME | WS_MAXIMIZEBOX;
@@ -480,6 +503,9 @@ impl WindowsWindow {
 
             (dwexstyle, dwstyle)
         };
+        if custom_frame {
+            dwexstyle |= WS_EX_WINDOWEDGE;
+        }
         if !disable_direct_composition {
             dwexstyle |= WS_EX_NOREDIRECTIONBITMAP;
         }
@@ -497,6 +523,7 @@ impl WindowsWindow {
             inner: None,
             handle,
             hide_title_bar,
+            custom_frame,
             display,
             is_movable: params.is_movable,
             is_resizable: params.is_resizable,
@@ -548,6 +575,7 @@ impl WindowsWindow {
             params.bounds,
             this.state.scale_factor.get(),
             &this.state.border_offset,
+            params.window_min_size,
         )?;
         if params.show {
             unsafe { SetWindowPlacement(hwnd, &placement)? };
@@ -618,8 +646,36 @@ impl PlatformWindow for WindowsWindow {
 
     fn resize(&mut self, size: Size<Pixels>) {
         let hwnd = self.0.hwnd;
-        let bounds = gpui::bounds(self.bounds().origin, size).to_device_pixels(self.scale_factor());
-        let rect = calculate_window_rect(bounds, &self.state.border_offset);
+        let size = size.to_device_pixels(self.scale_factor());
+        let mut rect = RECT::default();
+        if unsafe { GetWindowRect(hwnd, &mut rect) }
+            .log_err()
+            .is_none()
+        {
+            return;
+        }
+        rect.right = rect.left + size.width.0 + self.state.border_offset.width_offset.get();
+        rect.bottom = rect.top + size.height.0 + self.state.border_offset.height_offset.get();
+        let movable = !is_tool_window(hwnd) && !self.state.is_fullscreen();
+        if movable {
+            rect = fit_window_rect(
+                rect,
+                self.state
+                    .display
+                    .get()
+                    .visible_bounds()
+                    .to_device_pixels(self.scale_factor()),
+                minimum_outer_size(
+                    self.state.min_size,
+                    self.scale_factor(),
+                    &self.state.border_offset,
+                ),
+            );
+        }
+        let mut flags = SWP_NOACTIVATE | SWP_NOZORDER;
+        if !movable {
+            flags |= SWP_NOMOVE;
+        }
 
         self.0
             .executor
@@ -628,13 +684,42 @@ impl PlatformWindow for WindowsWindow {
                     SetWindowPos(
                         hwnd,
                         None,
-                        bounds.origin.x.0,
-                        bounds.origin.y.0,
+                        rect.left,
+                        rect.top,
                         rect.right - rect.left,
                         rect.bottom - rect.top,
-                        SWP_NOMOVE,
+                        flags,
                     )
                     .context("unable to set window content size")
+                    .log_err();
+                }
+            })
+            .detach();
+    }
+
+    fn start_window_move(&self) {
+        if !self.is_movable {
+            return;
+        }
+        let this = self.0.clone();
+        self.executor
+            .spawn(async move {
+                let mut cursor = POINT::default();
+                unsafe {
+                    if GetAsyncKeyState(VK_LBUTTON.0 as i32) >= 0
+                        || GetCursorPos(&mut cursor).log_err().is_none()
+                    {
+                        return;
+                    }
+                    ReleaseCapture().log_err();
+                    let position = (cursor.x as u16 as u32) | ((cursor.y as u16 as u32) << 16);
+                    PostMessageW(
+                        Some(this.hwnd),
+                        WM_SYSCOMMAND,
+                        WPARAM((SC_MOVE | HTCAPTION) as usize),
+                        LPARAM(position as isize),
+                    )
+                    .context("unable to start window move")
                     .log_err();
                 }
             })
@@ -1508,6 +1593,7 @@ fn retrieve_window_placement(
     initial_bounds: Bounds<Pixels>,
     scale_factor: f32,
     border_offset: &WindowBorderOffset,
+    minimum_size: Option<Size<Pixels>>,
 ) -> Result<WINDOWPLACEMENT> {
     let mut placement = WINDOWPLACEMENT {
         length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
@@ -1521,8 +1607,71 @@ fn retrieve_window_placement(
         display.default_bounds()
     };
     let bounds = bounds.to_device_pixels(scale_factor);
-    placement.rcNormalPosition = calculate_window_rect(bounds, border_offset);
+    let mut rect = calculate_window_rect(bounds, border_offset);
+    if !is_tool_window(hwnd) {
+        rect = fit_window_rect(
+            rect,
+            display.visible_bounds().to_device_pixels(scale_factor),
+            minimum_outer_size(minimum_size, scale_factor, border_offset),
+        );
+    }
+    placement.rcNormalPosition =
+        translate_rect(rect, workspace_offset(hwnd, display, scale_factor), -1);
     Ok(placement)
+}
+
+fn is_tool_window(hwnd: HWND) -> bool {
+    unsafe { get_window_long(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW.0 != 0 }
+}
+
+fn workspace_offset(hwnd: HWND, display: WindowsDisplay, scale_factor: f32) -> Point<DevicePixels> {
+    if is_tool_window(hwnd) {
+        return point(DevicePixels(0), DevicePixels(0));
+    }
+    display
+        .visible_bounds()
+        .to_device_pixels(scale_factor)
+        .origin
+        - display.physical_bounds().origin
+}
+
+fn translate_rect(mut rect: RECT, offset: Point<DevicePixels>, direction: i32) -> RECT {
+    rect.left += offset.x.0 * direction;
+    rect.right += offset.x.0 * direction;
+    rect.top += offset.y.0 * direction;
+    rect.bottom += offset.y.0 * direction;
+    rect
+}
+
+fn minimum_outer_size(
+    minimum: Option<Size<Pixels>>,
+    scale_factor: f32,
+    border_offset: &WindowBorderOffset,
+) -> Size<DevicePixels> {
+    let minimum = minimum.unwrap_or_default().to_device_pixels(scale_factor);
+    size(
+        DevicePixels((minimum.width.0 + border_offset.width_offset.get()).max(1)),
+        DevicePixels((minimum.height.0 + border_offset.height_offset.get()).max(1)),
+    )
+}
+
+fn fit_window_rect(rect: RECT, work: Bounds<DevicePixels>, minimum: Size<DevicePixels>) -> RECT {
+    let width =
+        (rect.right - rect.left).clamp(minimum.width.0, work.size.width.0.max(minimum.width.0));
+    let height =
+        (rect.bottom - rect.top).clamp(minimum.height.0, work.size.height.0.max(minimum.height.0));
+    let left = rect
+        .left
+        .clamp(work.left().0, (work.right().0 - width).max(work.left().0));
+    let top = rect
+        .top
+        .clamp(work.top().0, (work.bottom().0 - height).max(work.top().0));
+    RECT {
+        left,
+        top,
+        right: left + width,
+        bottom: top + height,
+    }
 }
 
 fn dwm_set_window_composition_attribute(hwnd: HWND, backdrop_type: u32) {
@@ -1609,9 +1758,89 @@ fn set_non_rude_hwnd(hwnd: HWND, non_rude: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::ClickState;
-    use gpui::{DevicePixels, MouseButton, point};
+    use super::{ClickState, custom_frame_enabled, fit_window_rect, translate_rect};
+    use gpui::{Bounds, DevicePixels, MouseButton, point, size};
     use std::time::Duration;
+    use windows::Win32::Foundation::RECT;
+
+    #[test]
+    fn custom_frame_requires_a_normal_window_with_an_explicit_transparent_titlebar() {
+        assert!(custom_frame_enabled(true, Some(true)));
+        for (normal_window, transparent_titlebar) in [
+            (true, Some(false)),
+            (true, None),
+            (false, Some(true)),
+            (false, Some(false)),
+            (false, None),
+        ] {
+            assert!(!custom_frame_enabled(normal_window, transparent_titlebar));
+        }
+    }
+
+    #[test]
+    fn expanded_window_moves_above_bottom_taskbar() {
+        let work = Bounds {
+            origin: point(DevicePixels(0), DevicePixels(0)),
+            size: size(DevicePixels(1280), DevicePixels(760)),
+        };
+        let rect = fit_window_rect(
+            RECT {
+                left: 467,
+                top: 199,
+                right: 1083,
+                bottom: 867,
+            },
+            work,
+            size(DevicePixels(1), DevicePixels(1)),
+        );
+        assert_eq!(
+            (rect.left, rect.top, rect.right, rect.bottom),
+            (467, 92, 1083, 760)
+        );
+    }
+
+    #[test]
+    fn oversized_settings_shrink_but_editor_minimum_is_preserved() {
+        let work = Bounds {
+            origin: point(DevicePixels(-1280), DevicePixels(0)),
+            size: size(DevicePixels(1280), DevicePixels(760)),
+        };
+        let requested = RECT {
+            left: -1100,
+            top: -15,
+            right: -302,
+            bottom: 799,
+        };
+        let settings = fit_window_rect(requested, work, size(DevicePixels(796), DevicePixels(599)));
+        assert_eq!(
+            (settings.left, settings.top, settings.right, settings.bottom),
+            (-1100, 0, -302, 760)
+        );
+        let editor = fit_window_rect(requested, work, size(DevicePixels(1296), DevicePixels(839)));
+        assert_eq!(
+            (editor.left, editor.top, editor.right, editor.bottom),
+            (-1280, 0, 16, 839)
+        );
+    }
+
+    #[test]
+    fn top_and_left_taskbar_workspace_coordinates_round_trip() {
+        let screen = RECT {
+            left: -1800,
+            top: 80,
+            right: -900,
+            bottom: 700,
+        };
+        for offset in [
+            point(DevicePixels(0), DevicePixels(40)),
+            point(DevicePixels(60), DevicePixels(0)),
+        ] {
+            let workspace = translate_rect(screen, offset, -1);
+            assert_eq!(workspace.left, screen.left - offset.x.0);
+            assert_eq!(workspace.top, screen.top - offset.y.0);
+            assert_eq!(translate_rect(workspace, offset, 1), screen);
+        }
+    }
 
     #[test]
     fn test_double_click_interval() {

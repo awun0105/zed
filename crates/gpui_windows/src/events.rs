@@ -714,6 +714,18 @@ impl WindowsWindowInner {
             return None;
         }
 
+        if self.custom_frame && !self.state.is_maximized() {
+            let dpi = unsafe { GetDpiForWindow(handle) };
+            let (frame, top) =
+                custom_frame_insets(get_frame_thicknessx(dpi), dpi, windows_build_number());
+            let params = unsafe { &mut *(lparam.0 as *mut NCCALCSIZE_PARAMS) };
+            params.rgrc[0].left += frame;
+            params.rgrc[0].top += top;
+            params.rgrc[0].right -= frame;
+            params.rgrc[0].bottom -= frame;
+            return Some(0);
+        }
+
         unsafe {
             let params = lparam.0 as *mut NCCALCSIZE_PARAMS;
             let saved_top = (*params).rgrc[0].top;
@@ -844,20 +856,12 @@ impl WindowsWindowInner {
                     .context("unable to set maximized window position after dpi has changed")
                     .log_err();
                 }
-
-                // SetWindowPos may not send WM_SIZE for maximized windows in some cases,
-                // so we manually update the size to ensure proper rendering
-                let device_size = size(DevicePixels(width), DevicePixels(height));
-                self.handle_size_change(device_size, new_scale_factor, true);
             }
         } else {
             // For non-maximized windows, use the suggested RECT from the system
             let rect = unsafe { &*(lparam.0 as *const RECT) };
             let width = rect.right - rect.left;
             let height = rect.bottom - rect.top;
-            // this will emit `WM_SIZE` and `WM_MOVE` right here
-            // even before this function returns
-            // the new size is handled in `WM_SIZE`
             unsafe {
                 SetWindowPos(
                     handle,
@@ -871,6 +875,21 @@ impl WindowsWindowInner {
                 .context("unable to set window position after dpi has changed")
                 .log_err();
             }
+        }
+
+        // SetWindowPos can omit a final WM_SIZE; its outer bounds also include native captions.
+        let mut client_rect = RECT::default();
+        if !unsafe { IsIconic(handle) }.as_bool()
+            && unsafe { GetClientRect(handle, &mut client_rect) }
+                .context("unable to get client bounds after dpi has changed")
+                .log_err()
+                .is_some()
+        {
+            let device_size = size(
+                DevicePixels((client_rect.right - client_rect.left).max(1)),
+                DevicePixels((client_rect.bottom - client_rect.top).max(1)),
+            );
+            self.handle_size_change(device_size, self.state.scale_factor.get(), true);
         }
 
         Some(0)
@@ -1650,6 +1669,32 @@ pub(crate) fn current_capslock() -> Capslock {
     Capslock { on }
 }
 
+fn custom_frame_insets(frame: i32, dpi: u32, windows_build: u32) -> (i32, i32) {
+    let top = if windows_build >= 22000 {
+        (dpi as f32 / 96.).round() as i32
+    } else {
+        0
+    };
+    (frame, top)
+}
+
+fn windows_build_number() -> u32 {
+    use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
+
+    static BUILD: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *BUILD.get_or_init(|| {
+        let mut version = OSVERSIONINFOW {
+            dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+            ..Default::default()
+        };
+        if unsafe { windows::Wdk::System::SystemServices::RtlGetVersion(&mut version) }.is_ok() {
+            version.dwBuildNumber
+        } else {
+            0
+        }
+    })
+}
+
 // there is some additional non-visible space when talking about window
 // borders on Windows:
 // - SM_CXSIZEFRAME: The resize handle.
@@ -1686,5 +1731,42 @@ fn notify_frame_changed(handle: HWND) {
                 | SWP_NOZORDER,
         )
         .log_err();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::custom_frame_insets;
+
+    #[test]
+    fn windows_10_has_no_top_inset_at_any_scale() {
+        for build in [19045, 21999] {
+            for (frame, dpi) in [(8, 96), (10, 120), (12, 144), (16, 192), (24, 288)] {
+                assert_eq!(custom_frame_insets(frame, dpi, build), (frame, 0));
+            }
+        }
+    }
+
+    #[test]
+    fn windows_11_preserves_the_first_client_row_at_each_scale() {
+        for build in [22000, 22621, 26100] {
+            for (frame, dpi, top) in [
+                (8, 96, 1),
+                (10, 120, 1),
+                (12, 144, 2),
+                (14, 168, 2),
+                (16, 192, 2),
+                (20, 240, 3),
+                (24, 288, 3),
+            ] {
+                assert_eq!(custom_frame_insets(frame, dpi, build), (frame, top));
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_windows_build_does_not_restore_a_native_titlebar() {
+        assert_eq!(custom_frame_insets(8, 96, 0), (8, 0));
+        assert_eq!(custom_frame_insets(16, 192, 0), (16, 0));
     }
 }

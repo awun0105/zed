@@ -108,6 +108,15 @@ impl PlatformAtlas for DirectXAtlas {
             AtlasTextureKind::Polychrome => &mut lock.polychrome_textures,
             AtlasTextureKind::Subpixel => &mut lock.subpixel_textures,
         };
+        let cached_texture_index = if id.kind == AtlasTextureKind::Polychrome {
+            textures.textures.iter().position(|entry| {
+                entry
+                    .as_ref()
+                    .is_some_and(|entry| entry.live_atlas_keys == 0)
+            })
+        } else {
+            None
+        };
 
         let Some(texture_slot) = textures.textures.get_mut(id.index as usize) else {
             return;
@@ -116,7 +125,13 @@ impl PlatformAtlas for DirectXAtlas {
         if let Some(mut texture) = texture_slot.take() {
             texture.allocator.deallocate(tile.tile_id.into());
             texture.decrement_ref_count();
-            if texture.is_unreferenced() {
+            if texture.is_unreferenced() && id.kind == AtlasTextureKind::Polychrome {
+                *texture_slot = Some(texture);
+                if let Some(index) = cached_texture_index {
+                    textures.textures[index] = None;
+                    textures.free_list.push(index);
+                }
+            } else if texture.is_unreferenced() {
                 textures.free_list.push(texture.id.index as usize);
             } else {
                 *texture_slot = Some(texture);
@@ -416,5 +431,37 @@ mod tests {
 
         let tile_b = insert_tile(&atlas, &big_key_b, big);
         assert_eq!(tile_b.texture_id, keeper_tile.texture_id);
+    }
+
+    #[test]
+    fn test_reuses_one_unreferenced_polychrome_texture() {
+        let Some(atlas) = create_atlas() else {
+            return;
+        };
+
+        let small = Size {
+            width: DevicePixels(64),
+            height: DevicePixels(64),
+        };
+        let large = Size {
+            width: DevicePixels(1280),
+            height: DevicePixels(720),
+        };
+        let small_key = make_image_key(10);
+        let first_key = make_image_key(11);
+        let second_key = make_image_key(12);
+
+        insert_tile(&atlas, &small_key, small);
+        atlas.remove(&small_key);
+        let first = insert_tile(&atlas, &first_key, large);
+        atlas.remove(&first_key);
+        let second = insert_tile(&atlas, &second_key, large);
+
+        assert_eq!(first.texture_id, second.texture_id);
+        let state = atlas.0.lock();
+        assert_eq!(
+            state.polychrome_textures.textures.iter().flatten().count(),
+            1
+        );
     }
 }

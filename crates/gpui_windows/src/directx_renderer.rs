@@ -1983,3 +1983,41 @@ mod dxgi {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
+    use gpui::{PolychromeSprite, Quad};
+    use windows::{Win32::Graphics::Direct3D::Fxc::D3DDisassemble, core::PCSTR};
+
+    #[test]
+    fn compiled_shader_strides_match_uploaded_primitives() {
+        for (module, stride) in [
+            (ShaderModule::Quad, size_of::<Quad>()),
+            (
+                ShaderModule::PolychromeSprite,
+                size_of::<PolychromeSprite>(),
+            ),
+        ] {
+            for target in [ShaderTarget::Vertex, ShaderTarget::Fragment] {
+                let shader = RawShaderBytes::new(module, target).unwrap();
+                let bytes = shader.as_bytes();
+                let assembly = unsafe {
+                    D3DDisassemble(bytes.as_ptr().cast(), bytes.len(), 0, PCSTR::null()).unwrap()
+                };
+                let text = unsafe {
+                    std::slice::from_raw_parts(
+                        assembly.GetBufferPointer().cast::<u8>(),
+                        assembly.GetBufferSize(),
+                    )
+                };
+                let text = String::from_utf8_lossy(text);
+                let declaration = format!("dcl_resource_structured t1, {stride}");
+                assert!(
+                    text.lines().any(|line| line.trim() == declaration),
+                    "{module:?} {target:?} does not match Rust's {stride}-byte stride"
+                );
+            }
+        }
+    }
+}

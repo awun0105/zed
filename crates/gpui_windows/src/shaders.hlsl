@@ -36,6 +36,17 @@ struct Edges {
     float left;
 };
 
+struct EdgeFadeParams {
+    float top_y;
+    float bottom_y;
+    float band_top;
+    float band_bottom;
+    float left_x;
+    float right_x;
+    float band_left;
+    float band_right;
+};
+
 struct Hsla {
     float h;
     float s;
@@ -92,6 +103,23 @@ struct TransformationMatrix {
 
 static const float M_PI_F = 3.141592653f;
 static const float3 GRAYSCALE_FACTORS = float3(0.2126f, 0.7152f, 0.0722f);
+
+float edge_fade_alpha(float2 position, EdgeFadeParams fade) {
+    float ramp = 1.0;
+    if (fade.band_top > 0.0) {
+        ramp = min(ramp, saturate((position.y - fade.top_y) / fade.band_top));
+    }
+    if (fade.band_bottom > 0.0) {
+        ramp = min(ramp, saturate((fade.bottom_y - position.y) / fade.band_bottom));
+    }
+    if (fade.band_left > 0.0) {
+        ramp = min(ramp, saturate((position.x - fade.left_x) / fade.band_left));
+    }
+    if (fade.band_right > 0.0) {
+        ramp = min(ramp, saturate((fade.right_x - position.x) / fade.band_right));
+    }
+    return ramp * ramp;
+}
 
 float4 to_device_position_impl(float2 position) {
     float2 device_position = position / global_viewport_size * float2(2.0, -2.0) + float2(-1.0, 1.0);
@@ -502,6 +530,7 @@ struct Quad {
     Hsla border_color;
     Corners corner_radii;
     Edges border_widths;
+    EdgeFadeParams fade;
 };
 
 struct QuadVertexOutput {
@@ -554,6 +583,8 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
     Quad quad = quads[input.quad_id];
     float4 background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);
+    float fade_alpha = edge_fade_alpha(input.position.xy, quad.fade);
+    background_color.a *= fade_alpha;
 
     bool unrounded = quad.corner_radii.top_left == 0.0 &&
         quad.corner_radii.top_right == 0.0 &&
@@ -661,6 +692,7 @@ float4 quad_fragment(QuadFragmentInput input): SV_Target {
     float4 color = background_color;
     if (border_sdf < antialias_threshold) {
         float4 border_color = input.border_color;
+        border_color.a *= fade_alpha;
         // Dashed border logic when border_style == 1
         if (quad.border_style == 1) {
             // Position along the perimeter in "dash space", where each dash
@@ -1209,6 +1241,7 @@ struct PolychromeSprite {
     Bounds bounds;
     Bounds content_mask;
     Corners corner_radii;
+    EdgeFadeParams fade;
     AtlasTile tile;
 };
 
@@ -1253,6 +1286,6 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
         float3 grayscale = dot(color.rgb, GRAYSCALE_FACTORS);
         color = float4(grayscale, sample.a);
     }
-    color.a *= sprite.opacity * saturate(0.5 - distance);
+    color.a *= sprite.opacity * saturate(0.5 - distance) * edge_fade_alpha(input.position.xy, sprite.fade);
     return color;
 }
