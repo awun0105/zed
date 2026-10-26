@@ -590,7 +590,12 @@ impl CosmicTextSystemState {
 
             let shaped_glyph = ShapedGlyph {
                 id: GlyphId(glyph.glyph_id as u32),
-                position: point(glyph.x.into(), glyph.y.into()),
+                // Shaping offsets anchor combining marks to their base glyph.
+                // cosmic-text's positive y offset points upward.
+                position: point(
+                    (glyph.x + glyph.font_size * glyph.x_offset).into(),
+                    (glyph.y - glyph.font_size * glyph.y_offset).into(),
+                ),
                 index: glyph.start,
                 is_emoji,
             };
@@ -865,6 +870,101 @@ fn check_is_known_emoji_font(postscript_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layout_preserves_combining_mark_offsets() {
+        let fixtures: [(&str, &[u8]); 2] = [
+            (
+                "IBM Plex Sans",
+                include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"),
+            ),
+            (
+                "Lilex",
+                include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf"),
+            ),
+        ];
+        for (family, bytes) in fixtures {
+            let text_system = CosmicTextSystem::new_without_system_fonts(family);
+            text_system.add_fonts(vec![Cow::Borrowed(bytes)]).unwrap();
+            let font_id = text_system.font_id(&gpui::font(family)).unwrap();
+            let mut database = cosmic_text::fontdb::Database::new();
+            database.load_font_data(bytes.to_vec());
+            let mut reference_fonts = FontSystem::new_with_locale_and_db("en-US".into(), database);
+
+            for text in [
+                "English: office, punctuation!",
+                "những mẫu chữ: ẵ ẫ ễ ỗ ỡ ữ; x\u{0303}",
+                "u\u{031b}\u{0303} a\u{0302}\u{0303} e\u{0302}\u{0303}; x\u{0303}",
+                "x\u{0303}\u{0301}",
+            ] {
+                for font_size in [13.0, 26.0] {
+                    let attrs = AttrsList::new(&Attrs::new().family(Family::Name(family)));
+                    let line = ShapeLine::new(
+                        &mut reference_fonts,
+                        text,
+                        &attrs,
+                        cosmic_text::Shaping::Advanced,
+                        4,
+                    );
+                    let mut layouts = Vec::new();
+                    line.layout_to_buffer(
+                        &mut ShapeBuffer::default(),
+                        font_size,
+                        None,
+                        cosmic_text::Wrap::None,
+                        Ellipsize::None,
+                        None,
+                        &mut layouts,
+                        None,
+                        cosmic_text::Hinting::Disabled,
+                    );
+                    let expected = &layouts[0];
+                    let actual = text_system.layout_line(
+                        text,
+                        font_size.into(),
+                        &[FontRun {
+                            len: text.len(),
+                            font_id,
+                        }],
+                    );
+                    let actual_glyphs: Vec<_> =
+                        actual.runs.iter().flat_map(|run| &run.glyphs).collect();
+                    assert_eq!(actual_glyphs.len(), expected.glyphs.len());
+                    assert_eq!(actual.len, text.len());
+                    assert!((f32::from(actual.width) - expected.w).abs() < 0.001);
+                    if text.contains('\u{0303}') {
+                        // These fixtures compose Vietnamese vowels, so x + tilde ensures
+                        // that the regression also exercises a separately positioned mark.
+                        assert!(
+                            expected
+                                .glyphs
+                                .iter()
+                                .any(|glyph| glyph.x_offset != 0.0 || glyph.y_offset != 0.0)
+                        );
+                    }
+                    for (actual, expected) in actual_glyphs.iter().zip(&expected.glyphs) {
+                        assert_eq!(actual.id, GlyphId(expected.glyph_id as u32));
+                        assert_eq!(actual.index, expected.start);
+                        // Compare with cosmic-text's own rasterization coordinates at a
+                        // high scale to keep its pixel quantization below the tolerance.
+                        let physical = expected.physical((0.0, 0.0), 64.0);
+                        let expected_x =
+                            (physical.x as f32 + physical.cache_key.x_bin.as_float()) / 64.0;
+                        let expected_y =
+                            (physical.y as f32 + physical.cache_key.y_bin.as_float()) / 64.0;
+                        assert!(
+                            (f32::from(actual.position.x) - expected_x).abs() < 0.02,
+                            "{family}, {font_size}px, {text:?}: x offset lost for {expected:?}"
+                        );
+                        assert!(
+                            (f32::from(actual.position.y) - expected_y).abs() < 0.02,
+                            "{family}, {font_size}px, {text:?}: y offset lost for {expected:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     fn fid(i: usize) -> FontId {
         FontId(i)
